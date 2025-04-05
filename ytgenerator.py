@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Uniswap v4 YouTube Shorts Generator
+Uniswap v4 YouTube Shorts Generator (OpenCV Version)
 
 This script automates the generation of YouTube Shorts content focused on Uniswap v4.
 It processes a text file input to create AI-generated video and voiceover audio.
@@ -9,7 +9,7 @@ Requirements:
 - Python 3.8+
 - OpenAI API key (for GPT-4 and DALL-E 3)
 - ElevenLabs API key (for voice synthesis)
-- MoviePy library
+- OpenCV, ffmpeg-python, and Pillow libraries
 - FFMPEG installed
 """
 
@@ -18,18 +18,19 @@ import sys
 import json
 import time
 import argparse
+import tempfile
 import textwrap
+import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
+import cv2
+import numpy as np
+import ffmpeg
 import requests
+from PIL import Image, ImageDraw, ImageFont
 import openai
 from dotenv import load_dotenv
-from moviepy.editor import (
-    TextClip, ImageClip, AudioFileClip, CompositeVideoClip, 
-    concatenate_videoclips, vfx
-)
-from pydub import AudioSegment
 
 # Load environment variables
 load_dotenv()
@@ -41,7 +42,6 @@ elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
 # Constants
 DEFAULT_VIDEO_SIZE = (1080, 1920)  # Portrait for YouTube Shorts
 DEFAULT_FONT_SIZE = 40
-DEFAULT_FONT = "Arial"
 DEFAULT_DURATION = 58  # YouTube Shorts are up to 60 seconds
 
 class UniswapShortsGenerator:
@@ -74,7 +74,20 @@ class UniswapShortsGenerator:
         self.segments = None
         self.images = []
         self.audio_files = []
+        self.temp_dir = Path(tempfile.mkdtemp())
         
+        # Try to load font, fallback to default if not found
+        try:
+            # For Windows
+            self.font = ImageFont.truetype("arial.ttf", DEFAULT_FONT_SIZE)
+        except IOError:
+            try:
+                # For macOS
+                self.font = ImageFont.truetype("/Library/Fonts/Arial.ttf", DEFAULT_FONT_SIZE)
+            except IOError:
+                # Fallback to default
+                self.font = ImageFont.load_default()
+    
     def read_input_file(self) -> str:
         """Read the input file content"""
         with open(self.input_file, "r", encoding="utf-8") as f:
@@ -209,80 +222,244 @@ class UniswapShortsGenerator:
                 print(f"Error generating audio {i+1}: {str(e)}")
                 self.audio_files.append(None)
     
+    def add_text_to_image(self, image_path: str, text: str) -> str:
+        """
+        Add text overlay to an image
+        
+        Args:
+            image_path: Path to the source image
+            text: Text to add to the image
+            
+        Returns:
+            Path to the new image with text overlay
+        """
+        # Open the image with PIL
+        img = Image.open(image_path)
+        
+        # Create a drawing context
+        draw = ImageDraw.Draw(img)
+        
+        # Calculate text position (bottom of image)
+        wrapped_text = textwrap.fill(text, width=30)
+        
+        # Get text size
+        # Use a simpler approach since not all PIL versions have textbbox
+        text_lines = wrapped_text.count('\n') + 1
+        estimated_text_height = self.font.size * text_lines
+        
+        # Create semi-transparent background for text
+        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        
+        text_y_position = img.height - estimated_text_height - 40  # padding
+        overlay_draw.rectangle(
+            [(0, text_y_position - 10), (img.width, img.height)],
+            fill=(0, 0, 0, 128)
+        )
+        
+        # Apply the overlay
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        img = Image.alpha_composite(img, overlay)
+        img = img.convert('RGB')  # Convert back to RGB for jpg support
+        
+        # Add text
+        draw = ImageDraw.Draw(img)
+        draw.multiline_text(
+            (img.width // 2, text_y_position),
+            wrapped_text,
+            font=self.font,
+            fill=(255, 255, 255),
+            align="center",
+            anchor="ma"  # middle alignment if supported
+        )
+        
+        # Save the modified image
+        output_path = self.temp_dir / f"text_{Path(image_path).name}"
+        img.save(output_path)
+        
+        return str(output_path)
+    
+    def create_intro_frame(self) -> str:
+        """
+        Create an intro frame with title
+        
+        Returns:
+            Path to the intro frame image
+        """
+        # Create a blank image (Uniswap pink background)
+        img = Image.new('RGB', DEFAULT_VIDEO_SIZE, (255, 51, 153))
+        draw = ImageDraw.Draw(img)
+        
+        # Add title text
+        title = "Uniswap v4 Explained"
+        
+        # Try to use a larger font for the title
+        try:
+            title_font = ImageFont.truetype("arial.ttf", 60)
+        except IOError:
+            try:
+                title_font = ImageFont.truetype("/Library/Fonts/Arial.ttf", 60)
+            except IOError:
+                title_font = self.font
+        
+        # Get text size for centering
+        # Simple approach for centering
+        draw.text(
+            (DEFAULT_VIDEO_SIZE[0] // 2, DEFAULT_VIDEO_SIZE[1] // 2),
+            title,
+            font=title_font,
+            fill=(255, 255, 255),
+            align="center",
+            anchor="mm"  # middle alignment if supported
+        )
+        
+        # Save the intro frame
+        output_path = self.temp_dir / "intro_frame.png"
+        img.save(output_path)
+        
+        return str(output_path)
+    
+    def get_audio_duration(self, audio_path: str) -> float:
+        """
+        Get the duration of an audio file using ffmpeg
+        
+        Args:
+            audio_path: Path to the audio file
+            
+        Returns:
+            Duration in seconds
+        """
+        probe = ffmpeg.probe(audio_path)
+        audio_info = next(stream for stream in probe['streams'] if stream['codec_type'] == 'audio')
+        return float(audio_info['duration'])
+    
     def create_video(self):
-        """Create the final video by combining images and audio"""
-        clips = []
+        """Create the final video by combining images and audio using OpenCV and ffmpeg"""
+        # Check if we have any valid segments
+        valid_segments = [(i, img, audio) for i, (img, audio) in enumerate(zip(self.images, self.audio_files))
+                          if img is not None and audio is not None]
+        
+        if not valid_segments:
+            print("No valid segments found. Cannot create video.")
+            return None
+        
+        segment_clips = []
         total_duration = 0
         
-        for i, (segment, img_path, audio_path) in enumerate(zip(self.segments, self.images, self.audio_files)):
-            if audio_path is None or img_path is None:
-                continue
+        # Process each segment
+        for i, img_path, audio_path in valid_segments:
+            # Get audio duration
+            audio_duration = self.get_audio_duration(audio_path)
+            
+            # Add text overlay to image
+            text = self.segments[i]['text']
+            img_with_text = self.add_text_to_image(img_path, text)
+            
+            # Create a temporary video segment with the image and audio
+            segment_output = self.temp_dir / f"segment_{i}.mp4"
+            
+            # Apply zoom effect by creating a video with OpenCV
+            img = cv2.imread(img_with_text)
+            height, width, _ = img.shape
+            
+            # Create video writer
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 30
+            writer = cv2.VideoWriter(str(segment_output), fourcc, fps, (width, height))
+            
+            # Calculate total frames
+            total_frames = int(audio_duration * fps)
+            
+            # Apply zoom effect
+            for frame_num in range(total_frames):
+                progress = frame_num / total_frames
+                zoom_factor = 1 + 0.05 * progress  # 5% zoom
                 
-            # Load audio and get its duration
-            audio_clip = AudioFileClip(audio_path)
-            audio_duration = audio_clip.duration
+                # Create zoomed frame
+                zoomed_size = int(width * zoom_factor), int(height * zoom_factor)
+                zoomed_img = cv2.resize(img, zoomed_size)
+                
+                # Calculate crop to maintain original size
+                start_x = (zoomed_size[0] - width) // 2
+                start_y = (zoomed_size[1] - height) // 2
+                
+                # Crop the zoomed image
+                cropped = zoomed_img[start_y:start_y+height, start_x:start_x+width]
+                
+                # Write the frame
+                writer.write(cropped)
             
-            # Create image clip
-            img_clip = ImageClip(img_path, duration=audio_duration)
-            img_clip = img_clip.resize(height=DEFAULT_VIDEO_SIZE[1])
-            img_clip = img_clip.set_position("center")
+            writer.release()
             
-            # Add subtle zoom effect
-            img_clip = img_clip.fx(vfx.resize, lambda t: 1 + 0.05 * t / audio_duration)
+            # Add audio to the segment using ffmpeg
+            segment_with_audio = self.temp_dir / f"segment_{i}_with_audio.mp4"
             
-            # Add text overlay
-            text = textwrap.fill(segment['text'], width=30)
-            txt_clip = TextClip(
-                text, 
-                fontsize=DEFAULT_FONT_SIZE, 
-                font=DEFAULT_FONT, 
-                color='white',
-                bg_color='rgba(0,0,0,0.5)',
-                method='caption',
-                size=(DEFAULT_VIDEO_SIZE[0] * 0.9, None)
-            )
-            txt_clip = txt_clip.set_position(('center', 'bottom')).set_duration(audio_duration)
+            # Use ffmpeg to add audio
+            try:
+                (
+                    ffmpeg
+                    .input(str(segment_output))
+                    .input(audio_path)
+                    .output(str(segment_with_audio), shortest=None, vcodec='copy')
+                    .overwrite_output()
+                    .run(quiet=True)
+                )
+            except ffmpeg.Error as e:
+                print(f"Error adding audio to segment {i}: {e.stderr.decode()}")
+                continue
             
-            # Combine image and text
-            composite = CompositeVideoClip([img_clip, txt_clip])
-            composite = composite.set_audio(audio_clip)
-            
-            clips.append(composite)
+            segment_clips.append(str(segment_with_audio))
             total_duration += audio_duration
         
-        # Concatenate all clips
-        final_clip = concatenate_videoclips(clips, method="compose")
-        
-        # Add intro text if there's time
+        # Create intro if there's time
         if total_duration < self.duration - 3:
-            intro_txt = TextClip(
-                "Uniswap v4 Explained", 
-                fontsize=60, 
-                font=DEFAULT_FONT, 
-                color='white',
-                bg_color='rgba(0,0,0,0.7)',
-                size=(DEFAULT_VIDEO_SIZE[0], None)
-            )
-            intro_txt = intro_txt.set_position('center').set_duration(3)
-            intro = CompositeVideoClip([
-                ColorClip(DEFAULT_VIDEO_SIZE, color=(255, 51, 153), duration=3),  # Uniswap pink background
-                intro_txt
-            ])
-            final_clip = concatenate_videoclips([intro, final_clip], method="compose")
+            intro_img = self.create_intro_frame()
+            intro_output = self.temp_dir / "intro.mp4"
+            
+            # Create intro video (3 seconds)
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 30
+            img = cv2.imread(intro_img)
+            height, width, _ = img.shape
+            
+            writer = cv2.VideoWriter(str(intro_output), fourcc, fps, (width, height))
+            
+            # Write the same frame for 3 seconds
+            for _ in range(3 * fps):
+                writer.write(img)
+            
+            writer.release()
+            
+            segment_clips.insert(0, str(intro_output))
         
-        # Ensure the final video has the correct dimensions
-        final_clip = final_clip.resize(DEFAULT_VIDEO_SIZE)
+        # Concatenate all segments using ffmpeg
+        if not segment_clips:
+            print("No valid segments to concatenate. Video creation failed.")
+            return None
         
-        # Write the final video file
+        # Create a list file for ffmpeg concat
+        concat_file = self.temp_dir / "concat.txt"
+        with open(concat_file, "w") as f:
+            for clip in segment_clips:
+                f.write(f"file '{clip}'\n")
+        
+        # Output final video
         output_path = self.output_dir / "uniswap_short.mp4"
-        final_clip.write_videofile(
-            str(output_path),
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            threads=4,
-            preset="ultrafast"  # For faster rendering during development
-        )
+        
+        # Concatenate videos
+        try:
+            subprocess.run([
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",
+                str(output_path)
+            ], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Error concatenating videos: {e}")
+            return None
         
         print(f"Video created successfully: {output_path}")
         return output_path
